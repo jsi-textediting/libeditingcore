@@ -79,7 +79,7 @@ typedef struct {
 
 typedef struct process_kill_s {
   int tries;
-  uint32_t start_time;
+  uint64_t start_time;
   process_handle_t handle;
   struct process_kill_s *next;
 } process_kill_t;
@@ -251,7 +251,7 @@ static bool process_handle_signal(process_handle_t handle, signal_e sig) {
 static int kill_list_worker(void *ud) {
   process_kill_list_t *list = (process_kill_list_t *) ud;
   process_kill_t *current_task;
-  uint32_t delay;
+  int64_t delay;
 
   while (true) {
     ec_mutex_lock(list->mutex);
@@ -285,9 +285,11 @@ static int kill_list_worker(void *ud) {
         free(current_task);
       }
     }
-    delay = list->head ? (list->head->start_time + PROCESS_TERM_DELAY) - ec_ticks_ms() : 0;
+    // signed: the deadline may already have passed while we were signalling
+    delay = list->head ? (int64_t) (list->head->start_time + PROCESS_TERM_DELAY) - (int64_t) ec_ticks_ms() : 0;
+    if (delay < 0) delay = 0;
     ec_mutex_unlock(list->mutex);
-    ec_sleep_ms(delay);
+    ec_sleep_ms((uint32_t) delay);
   }
   ec_mutex_unlock(list->mutex);
   return 0;
@@ -326,7 +328,7 @@ static void push_error(lua_State *L, const char *extra, process_error_t err) {
 }
 
 static bool poll_process(process_t* proc, int timeout) {
-  uint32_t ticks;
+  uint64_t ticks;
 
   if (!proc->running)
     return false;
@@ -344,7 +346,7 @@ static bool poll_process(process_t* proc, int timeout) {
     }
     if (timeout)
       ec_sleep_ms(timeout >= 5 ? 5 : 0);
-  } while (timeout == WAIT_INFINITE || (int)ec_ticks_ms() - ticks < timeout);
+  } while (timeout == WAIT_INFINITE || (int64_t) (ec_ticks_ms() - ticks) < timeout);
 
   return proc->running;
 }
@@ -727,6 +729,7 @@ static int f_write(lua_State* L) {
 static int f_close_stream(lua_State* L) {
   process_t* self = (process_t*) luaL_checkudata(L, 1, API_TYPE_PROCESS);
   int stream = luaL_checknumber(L, 2);
+  luaL_argcheck(L, stream >= STDIN_FD && stream <= STDERR_FD, 2, "invalid stream");
   close_fd(&self->child_pipes[stream][stream == STDIN_FD ? 1 : 0]);
   lua_pushboolean(L, 1);
   return 1;

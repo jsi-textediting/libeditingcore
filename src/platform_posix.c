@@ -56,9 +56,20 @@ struct ec_mutex { pthread_mutex_t m; };
 struct ec_cond { pthread_cond_t c; };
 struct ec_thread { pthread_t t; ec_thread_fn fn; void *data; int status; };
 
+/* Recursive, like the SDL mutexes this replaces and the Win32 critical
+ * section: f_dirmonitor_check runs a Lua callback with the lock held. */
 ec_mutex *ec_mutex_create(void) {
   ec_mutex *mutex = malloc(sizeof(*mutex));
-  if (mutex && pthread_mutex_init(&mutex->m, NULL) != 0) { free(mutex); mutex = NULL; }
+  if (mutex) {
+    pthread_mutexattr_t attr;
+    int err = pthread_mutexattr_init(&attr);
+    if (!err) {
+      err = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+      if (!err) err = pthread_mutex_init(&mutex->m, &attr);
+      pthread_mutexattr_destroy(&attr);
+    }
+    if (err) { free(mutex); mutex = NULL; }
+  }
   if (!mutex) set_error("cannot create mutex");
   return mutex;
 }
@@ -79,6 +90,8 @@ ec_cond *ec_cond_create(void) {
   return cond;
 }
 
+/* The mutex is recursive, but pthread_cond_wait only releases one level of
+ * it: callers must hold it exactly once when waiting (SDL had the same rule). */
 void ec_cond_wait(ec_cond *cond, ec_mutex *mutex) {
   if (cond && mutex) pthread_cond_wait(&cond->c, &mutex->m);
 }

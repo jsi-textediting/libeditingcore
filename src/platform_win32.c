@@ -3,12 +3,44 @@
 #include <ec/platform.h>
 #include <ec/utfconv.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <windows.h>
 
+#ifdef _MSC_VER
 static __declspec(thread) char error_buf[512];
+#else
+static _Thread_local char error_buf[512];
+#endif
 
-static void set_error(const char *fmt, DWORD code) {
-  snprintf(error_buf, sizeof(error_buf), fmt, (unsigned long) code);
+/* Sets "<what>: <system message>" (or just <what> when code is 0), like
+ * SDL's WIN_SetErrorFromHRESULT did. */
+static void set_error(const char *what, DWORD code) {
+  WCHAR *wmsg = NULL;
+  char *msg = NULL;
+  if (code) {
+    FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM
+                  | FORMAT_MESSAGE_ALLOCATE_BUFFER
+                  | FORMAT_MESSAGE_IGNORE_INSERTS,
+                  NULL, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                  (LPWSTR) &wmsg, 0, NULL);
+    if (wmsg) {
+      msg = utfconv_wctoutf8(wmsg);
+      LocalFree(wmsg);
+    }
+  }
+  if (msg) {
+    /* strip the trailing "\r\n" (and period) FormatMessage appends */
+    size_t len = strlen(msg);
+    while (len && (msg[len - 1] == '\r' || msg[len - 1] == '\n' || msg[len - 1] == '.'))
+      msg[--len] = '\0';
+    snprintf(error_buf, sizeof(error_buf), "%s: %s", what, msg);
+    free(msg);
+  } else if (code) {
+    snprintf(error_buf, sizeof(error_buf), "%s (error %lu)", what, (unsigned long) code);
+  } else {
+    snprintf(error_buf, sizeof(error_buf), "%s", what);
+  }
 }
 
 const char *ec_get_error(void) {
@@ -44,7 +76,7 @@ struct ec_thread { HANDLE handle; ec_thread_fn fn; void *data; int status; };
 ec_mutex *ec_mutex_create(void) {
   ec_mutex *mutex = malloc(sizeof(*mutex));
   if (mutex) InitializeCriticalSection(&mutex->cs);
-  else set_error("cannot create mutex (%lu)", 0);
+  else set_error("cannot create mutex: out of memory", 0);
   return mutex;
 }
 
@@ -60,7 +92,7 @@ void ec_mutex_destroy(ec_mutex *mutex) {
 ec_cond *ec_cond_create(void) {
   ec_cond *cond = malloc(sizeof(*cond));
   if (cond) InitializeConditionVariable(&cond->cv);
-  else set_error("cannot create condition variable (%lu)", 0);
+  else set_error("cannot create condition variable: out of memory", 0);
   return cond;
 }
 
@@ -81,12 +113,12 @@ static DWORD WINAPI thread_main(LPVOID arg) {
 ec_thread *ec_thread_create(ec_thread_fn fn, const char *name, void *data) {
   (void) name;
   ec_thread *thread = calloc(1, sizeof(*thread));
-  if (!thread) { set_error("out of memory (%lu)", 0); return NULL; }
+  if (!thread) { set_error("cannot create thread: out of memory", 0); return NULL; }
   thread->fn = fn;
   thread->data = data;
   thread->handle = CreateThread(NULL, 0, thread_main, thread, 0, NULL);
   if (!thread->handle) {
-    set_error("cannot create thread (%lu)", GetLastError());
+    set_error("cannot create thread", GetLastError());
     free(thread);
     return NULL;
   }
@@ -106,14 +138,14 @@ void ec_thread_join(ec_thread *thread, int *status) {
 bool ec_enumerate_directory(const char *path, ec_enum_callback callback, void *userdata) {
   size_t len = strlen(path);
   char *pattern = malloc(len + 3);
-  if (!pattern) return false;
+  if (!pattern) { set_error("cannot open directory: out of memory", 0); return false; }
   memcpy(pattern, path, len);
   if (len && path[len - 1] != '/' && path[len - 1] != '\\') pattern[len++] = '\\';
   pattern[len++] = '*';
   pattern[len] = '\0';
   LPWSTR wpattern = utfconv_utf8towc(pattern);
   free(pattern);
-  if (!wpattern) { set_error("invalid path (%lu)", 0); return false; }
+  if (!wpattern) { set_error("invalid path", GetLastError()); return false; }
 
   WIN32_FIND_DATAW data;
   HANDLE handle = FindFirstFileW(wpattern, &data);
@@ -121,7 +153,7 @@ bool ec_enumerate_directory(const char *path, ec_enum_callback callback, void *u
   if (handle == INVALID_HANDLE_VALUE) {
     DWORD err = GetLastError();
     if (err == ERROR_FILE_NOT_FOUND) return true; /* empty */
-    set_error("cannot open directory (%lu)", err);
+    set_error("cannot open directory", err);
     return false;
   }
   ec_enum_result result = EC_ENUM_CONTINUE;
@@ -138,16 +170,16 @@ bool ec_enumerate_directory(const char *path, ec_enum_callback callback, void *u
 
 bool ec_remove_path(const char *path) {
   LPWSTR wpath = utfconv_utf8towc(path);
-  if (!wpath) { set_error("invalid path (%lu)", 0); return false; }
+  if (!wpath) { set_error("invalid path", GetLastError()); return false; }
   DWORD attrs = GetFileAttributesW(wpath);
   bool ok;
   if (attrs == INVALID_FILE_ATTRIBUTES) {
     DWORD err = GetLastError();
     ok = err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND;
-    if (!ok) set_error("cannot remove path (%lu)", err);
+    if (!ok) set_error("cannot remove path", err);
   } else {
     ok = (attrs & FILE_ATTRIBUTE_DIRECTORY) ? RemoveDirectoryW(wpath) : DeleteFileW(wpath);
-    if (!ok) set_error("cannot remove path (%lu)", GetLastError());
+    if (!ok) set_error("cannot remove path", GetLastError());
   }
   free(wpath);
   return ok;
